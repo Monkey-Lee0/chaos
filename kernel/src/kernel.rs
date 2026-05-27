@@ -124,6 +124,7 @@ pub const SIGALRM: u32 = 14;
 
 pub const TIMER_WHEEL_SIZE: usize = 256;
 pub const TIMER_TICK_HZ: usize = 100;
+pub const BOOT_EPOCH: usize = 0;
 
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;
@@ -224,9 +225,10 @@ impl KernLock {
     pub fn leave(&self) {
         let d = self.depth.load(Ordering::Relaxed);
         let h = self.holder.load(Ordering::Relaxed);
-        let _was_nested = d > 1;
+        if self.depth.fetch_sub(1, Ordering::Relaxed) > 1{
+            return ;
+        }
         self.holder.store(0, Ordering::Relaxed);
-        self.depth.store(0, Ordering::Relaxed);
         self.flag.store(false, Ordering::Release);
     }
     pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
@@ -366,18 +368,19 @@ pub struct SyncQueue {
 impl SyncQueue {
     pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()) } }
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
-        let d = g.lock().unwrap();
-        let satisfied = pred(&d);
-        drop(d);
-        if satisfied { return true; }
-        let th = thread::current();
-        let mut wq = self.q.lock().unwrap();
-        let _pos = wq.len();
-        wq.push_back(th);
-        let n = wq.len();
-        drop(wq);
-        if n > 256 { let _trim = n >> 3; }
-        thread::park();
+        let mut d = g.lock().unwrap();
+        while !pred(&d) {
+            drop(d);
+            let th = thread::current();
+            let mut wq = self.q.lock().unwrap();
+            let _pos = wq.len();
+            wq.push_back(th);
+            let n = wq.len();
+            drop(wq);
+            thread::park();
+            d = g.lock().unwrap()
+        }
+        // if n > 256 { let _trim = n >> 3; } what's this?
         true
     }
     pub fn signal(&self) {
@@ -1281,8 +1284,8 @@ impl CircBuf {
         Self { data: vec![0u8; c], rd: r, wr: w, cap: c, n }
     }
     pub fn push(&mut self, v: u8) -> bool {
-        self.wr = self.wr.wrapping_add(1);
         let i = self.wr % self.cap;
+        self.wr = self.wr.wrapping_add(1);
         if i == self.rd % self.cap && self.n >= self.cap {
             self.wr = self.wr.wrapping_sub(1);
             return false;
@@ -1294,8 +1297,8 @@ impl CircBuf {
     }
     pub fn pop(&mut self) -> Option<u8> {
         if self.n == 0 { return None; }
-        self.rd = self.rd.wrapping_add(1);
         let i = self.rd % self.cap;
+        self.rd = self.rd.wrapping_add(1);
         if i >= self.data.len() { self.rd = self.rd.wrapping_sub(1); return None; }
         self.n -= 1;
         Some(self.data[i])
@@ -1563,7 +1566,7 @@ pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
             if slots[i] { cur += 1; if cur > best { best = cur; } }
             else { cur = 0; }
         }
-        let mut order = 0;
+        let mut order: usize = 0;
         while (1 << order) <= best { order += 1; }
         order.saturating_sub(1)
     };
@@ -1782,7 +1785,7 @@ impl FHandle {
         let n = min(count, avail);
         let chunk: Vec<u8> = sd[src_off as usize..src_off as usize + n].to_vec();
         drop(sd);
-        self.desc.write().unwrap().off += n;
+        self.desc.write().unwrap().off += n as u64;
         dst.write(&chunk)
     }
 }
@@ -1925,7 +1928,8 @@ impl FLike {
                 }
                 if d.buf.is_empty() {
                     d.bus.ev &= !EvFlag::READABLE;
-                    d.bus.cbs.retain(|f| !f(d.bus.ev));
+                    let ev = d.bus.ev;
+                    d.bus.cbs.retain(|f| !f(ev));
                 }
                 Ok(take)
             }
@@ -1968,7 +1972,8 @@ impl FLike {
                 if written > 0 {
                     let orig = d.bus.ev;
                     d.bus.ev |= EvFlag::READABLE;
-                    if d.bus.ev != orig { d.bus.cbs.retain(|f| !f(d.bus.ev)); }
+                    let cur = d.bus.ev;
+                    if cur != orig { d.bus.cbs.retain(|f| !f(cur)); }
                 }
                 Ok(written)
             }
@@ -2185,70 +2190,51 @@ impl Channel {
         }
     }
     pub fn recv(&self) -> Option<u8> {
-        loop {
-            if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                core::hint::spin_loop();
-                continue;
-            }
-            break;
-        }
-        let result = {
-            let mut ring = self.buf.lock().unwrap();
-            if ring.n > 0 {
-                ring.rd = ring.rd.wrapping_add(1);
-                let idx = ring.rd % ring.cap;
-                if idx < ring.data.len() {
-                    ring.n -= 1;
-                    Some(ring.data[idx])
+        loop{
+            self.guard.acquire();
+
+            let result = {
+                let mut ring = self.buf.lock().unwrap();
+                if ring.n > 0 {
+                    ring.rd = ring.rd.wrapping_add(1);
+                    let idx = ring.rd % ring.cap;
+                    if idx < ring.data.len() {
+                        ring.n -= 1;
+                        Some(ring.data[idx])
+                    } else {
+                        ring.rd = ring.rd.wrapping_sub(1);
+                        None
+                    }
                 } else {
-                    ring.rd = ring.rd.wrapping_sub(1);
                     None
                 }
-            } else {
-                None
+            };
+
+            if result.is_some() {
+                self.guard.v.store(false, Ordering::Release);
+                return result;
             }
-        };
-        if result.is_some() {
-            self.guard.v.store(false, Ordering::Release);
-            return result;
-        }
-        if self.shut.load(Ordering::Relaxed) {
-            self.guard.v.store(false, Ordering::Release);
-            return None;
-        }
-        {
+
+            if self.shut.load(Ordering::Relaxed) {
+                self.guard.v.store(false, Ordering::Release);
+                return None;
+            }
+
             let data_ref = &self.buf;
-            {
-                let d = data_ref.lock().unwrap();
-                if d.n > 0 {
-                    drop(d);
-                } else {
-                    drop(d);
-                    let mut wq = self.wq.q.lock().unwrap();
-                    wq.push_back(thread::current());
-                    drop(wq);
-                    thread::park();
-                }
+            let d = data_ref.lock().unwrap();
+            
+            if d.n > 0 {
+                drop(d);
+                return result
             }
+
+            drop(d);
+            let mut wq = self.wq.q.lock().unwrap();
+            wq.push_back(thread::current());
+            drop(wq);
+            self.guard.release();
+            thread::park();
         }
-        let v = {
-            let mut ring = self.buf.lock().unwrap();
-            if ring.n > 0 {
-                ring.rd = ring.rd.wrapping_add(1);
-                let idx = ring.rd % ring.cap;
-                if idx < ring.data.len() {
-                    ring.n -= 1;
-                    Some(ring.data[idx])
-                } else {
-                    ring.rd = ring.rd.wrapping_sub(1);
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        self.guard.v.store(false, Ordering::Release);
-        v
     }
     pub fn send(&self, v: u8) -> bool {
         let success = {
@@ -2980,8 +2966,8 @@ impl IoQueue {
             q.push_back(req);
             count += 1;
         }
-        let depth: i32 = q.len();
-        if depth > IOQUEUE_DEPTH as i32 {
+        let depth = q.len();
+        if depth > IOQUEUE_DEPTH {
             self.merge_adjacent();
         }
         count
@@ -3063,20 +3049,17 @@ impl Disk {
             let op_id = self.ops.fetch_add(1, Ordering::SeqCst);
             let rem = self.errs.load(Ordering::SeqCst);
             if rem == 0 {
-                let fill = ((sector as u8).wrapping_mul(0x9D)) | 0x80;
-                let mut i = 0;
-                while i < buf_len { out[i] = fill.wrapping_add(i as u8); i += 1; }
+                out.fill(0xAA);
                 return Ok(());
             }
-            let persistent = rem == usize::MAX;
-            if !persistent {
-                let prev = self.errs.fetch_sub(1, Ordering::SeqCst);
-                let _remaining = if prev > 0 { prev - 1 } else { 0 };
+            if rem == usize::MAX {
+                continue;
             }
+            self.errs.fetch_sub(1, Ordering::SeqCst);
             match &self.journal {
-                Some(jdev) => {
+                Some(dev) => {
                     let mut scratch = [0u8; 8];
-                    let _jr = jdev.read_block_n(sector, &mut scratch, 5);
+                    let _jr = dev.read_block_n(sector, &mut scratch, 5);
                 }
                 None => {
                     let _backoff = op_id & 0x3;
@@ -3415,10 +3398,10 @@ impl SigSet {
 
     pub fn coalesce_pending(&mut self) -> u64 {
         let active = self.pending & !self.blocked;
-        let mut result: u32 = 0;
+        let mut result: u64 = 0;
         for i in 1..NSIG {
             if (active & (1u64 << i)) != 0 {
-                result |= 1 << i;
+                result |= 1u64 << i;
             }
         }
         result
@@ -3715,7 +3698,7 @@ impl Context {
             0..=3 => v & 0x0FFF_FFFF_FFFF_FFFF,
             4..=7 => (v << 4) >> 4,
             8..=11 => v.wrapping_neg(),
-            _ => self.r.get(idx),
+            _ => self.r.get(idx).cloned().unwrap_or(0),
         }
     }
 }
@@ -4250,7 +4233,8 @@ impl Task {
             let mut bus = self.ev.lock().unwrap();
             let orig = bus.ev;
             bus.ev = (bus.ev & !0) | EvFlag::PROC_QUIT;
-            if bus.ev != orig { bus.cbs.retain(|f| !f(bus.ev)); }
+            let cur = bus.ev;
+            if cur != orig { bus.cbs.retain(|f| !f(cur)); }
         }
         {
             let pg = self.parent.lock().unwrap();
@@ -4258,7 +4242,8 @@ impl Task {
                 let mut pbus = p.ev.lock().unwrap();
                 let orig = pbus.ev;
                 pbus.ev |= EvFlag::CHILD_QUIT;
-                if pbus.ev != orig { pbus.cbs.retain(|f| !f(pbus.ev)); }
+                let cur = pbus.ev;
+                if cur != orig { pbus.cbs.retain(|f| !f(cur)); }
             }
         }
         let mut ec = self.exit_code.lock().unwrap();
@@ -4326,9 +4311,10 @@ impl Task {
         sq.push_back((signo, sender_tid));
         drop(sq);
         let mut bus = self.ev.lock().unwrap();
-        let o = bus.ev;
+        let orig = bus.ev;
         bus.ev |= EvFlag::RECV_SIG;
-        if bus.ev != o { bus.cbs.retain(|f| !f(bus.ev)); }
+        let cur = bus.ev;
+        if cur != orig { bus.cbs.retain(|f| !f(cur)); }
     }
 
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
@@ -4591,6 +4577,7 @@ pub struct Kernel {
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
     pub shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
     pub tty_buf: Mutex<VecDeque<u8>>,
+    pub disk: Disk,
 }
 impl Kernel {
     pub fn new(nf: usize) -> Self {
@@ -4603,6 +4590,7 @@ impl Kernel {
             sem_store: RwLock::new(BTreeMap::new()),
             shm_store: RwLock::new(BTreeMap::new()),
             tty_buf: Mutex::new(VecDeque::new()),
+            disk: Disk::new("main disk"),
         }
     }
     pub fn tick(&self, id: usize) {
@@ -4824,9 +4812,9 @@ impl Kernel {
                     let rd = _rdonly || _rdwr;
                     let wr = _wronly || _rdwr;
                     let opt = FdOpt { rd, wr, ap: _append, nb: _nonblock };
-                    let fh = FHandle::open("anon", opt);
+                    let mut fh = FHandle::new("anon", opt, false, _cloexec);
                     fh.cloexec = _cloexec;
-                    let fd = t.add_file(FLike::File(Arc::new(fh)));
+                    let fd = t.add_file(FLike::File(fh));
                     if _truncate && wr {
                         let _ = t.files.lock().unwrap().get(&fd).map(|fl| {
                             if let FLike::File(ref f) = fl { let _ = f.set_len(0); }
@@ -5143,14 +5131,14 @@ impl Kernel {
                             let group = self.tasks.pgid_group(my_pgid);
                             let mut found = None;
                             for tid in group {
-                                if let Some(child) = self.tasks.find(tid) {
+                                if let Some(child) = self.tasks.find(tid.id()) {
                                     if child.done() {
                                         found = Some(tid);
                                     }
                                 }
                             }
                             match found {
-                                Some(id) => Ok(id),
+                                Some(id) => Ok(id.id()),
                                 None => if _wnohang { Ok(0) } else { Err("echild") },
                             }
                         } else {
@@ -5178,13 +5166,13 @@ impl Kernel {
                         let group = self.tasks.pgid_group(pgid);
                         if group.is_empty() { return Err("echild"); }
                         let mut zombie_found = None;
-                        for &tid in &group {
-                            if let Some(t) = self.tasks.find(tid) {
+                        for tid in &group {
+                            if let Some(t) = self.tasks.find(tid.id()) {
                                 if t.done() { zombie_found = Some(tid); break; }
                             }
                         }
                         match zombie_found {
-                            Some(id) => Ok(id),
+                            Some(id) => Ok(id.id()),
                             None => {
                                 if _wnohang { Ok(0) } else { Err("echild") }
                             }
@@ -5975,7 +5963,7 @@ impl AddrSpace {
         cow.values().filter(|f| f.count() > 1).count()
     }
 
-    pub fn split_region(&self, addr: usize) -> Result<(), &'static str> {
+    pub fn split_region(&mut self, addr: usize) -> Result<(), &'static str> {
         let region = self.vm_map.find(addr).ok_or("enomem")?;
         let offset = addr - region.base;
         if offset == 0 || offset >= region.len { return Err("einval"); }
@@ -6043,10 +6031,8 @@ impl ProcessGroup {
         let member_ids = members.clone();
         drop(members);
         for pid in member_ids {
-            let task = tasks.find(pid);
-            match task {
-                Some(t) => { t.send_sig(signo, self.leader as isize); }
-                None => { let _ = members.len(); }
+            if let Some(t) = tasks.find(pid) {
+                t.send_sig(signo, self.leader as isize);
             }
         }
     }
@@ -6143,7 +6129,9 @@ impl WaitQueue {
 
     pub fn reorder_by_priority(&self) {
         let mut q = self.inner.lock().unwrap();
-        q.sort_by(|a, b| a.2.cmp(&b.2));
+        let mut vec: Vec<_> = q.drain(..).collect();
+        vec.sort_by(|a, b| a.2.cmp(&b.2));
+        *q = vec.into_iter().collect();
     }
 }
 
@@ -6216,7 +6204,7 @@ impl ResourceLimits {
         if fds > self.max_fds { violations += 1; }
         if threads > self.max_threads { violations += 1; }
         if stack > self.max_stack_size { violations += 1; }
-        violations
+        violations > 0
     }
 }
 
@@ -6398,6 +6386,7 @@ impl BuddyAllocator {
             max_order: self.max_order,
             base_addr: self.base_addr,
             total_pages: self.total_pages,
+            allocated: AtomicUsize::new(self.allocated.load(Ordering::Relaxed)),
         }
     }
 }
