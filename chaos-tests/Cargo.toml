@@ -6,6 +6,8 @@ description = "Test suite for the Chaos Monolith Kernel debugging exercise"
 
 [dependencies]
 spin = "0.12.0"
+rcore-memory = { path = "../crate/memory" }
+sync = { path = "../crate/sync" }
 
 [dev-dependencies]
 
