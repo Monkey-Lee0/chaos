@@ -18,7 +18,7 @@ impl KernLock {
             return;
         }
         while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            core::hint::spin_loop();
+            core::sync::atomic::spin_loop_hint()
         }
         self.holder.store(id, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
@@ -56,7 +56,7 @@ impl Spin {
     pub const fn new() -> Self { Self { v: AtomicBool::new(false) } }
     pub fn acquire(&self) {
         while self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            core::hint::spin_loop();
+            core::sync::atomic::spin_loop_hint()
         }
     }
     pub fn try_acquire(&self) -> bool {

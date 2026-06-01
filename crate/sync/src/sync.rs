@@ -1,7 +1,7 @@
 // by AI below
 
 use core::cell::UnsafeCell;
-use core::hint::spin_loop;
+use core::sync::atomic::spin_loop_hint as spin_loop;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 

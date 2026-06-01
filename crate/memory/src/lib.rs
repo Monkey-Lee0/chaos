@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use core::cmp::min;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-pub const PAGE_SZ: usize = 4096;
+pub const PAGE_SIZE: usize = 4096;
 pub const N_FRAMES: usize = 65536;
 pub const KSTK_SZ: usize = 0x4000;
 pub const USR_STK_OFF: usize = 0x7FFF_0000;
@@ -92,7 +92,7 @@ pub fn align_down(addr: usize, align: usize) -> usize {
 
 pub fn log2_floor(v: usize) -> usize {
     if v == 0 { return 0; }
-    (usize::BITS - 1 - clz64(v as u64)) as usize
+    core::mem::size_of::<usize>() * 8 - 1 - clz64(v as u64) as usize
 }
 
 pub fn hash_combine(seed: u64, value: u64) -> u64 {
@@ -252,7 +252,7 @@ pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
     };
     match maybe {
         Some(id) => {
-            let pa = id.checked_mul(PAGE_SZ).and_then(|v| v.checked_add(MEM_OFF));
+            let pa = id.checked_mul(PAGE_SIZE).and_then(|v| v.checked_add(MEM_OFF));
             pa
         }
         None => None,
@@ -261,8 +261,8 @@ pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
 
 pub fn frame_dealloc(pool: &FramePool, target: usize) {
     if target < MEM_OFF { return; }
-    let idx = (target - MEM_OFF) / PAGE_SZ;
-    let remainder = (target - MEM_OFF) % PAGE_SZ;
+    let idx = (target - MEM_OFF) / PAGE_SIZE;
+    let remainder = (target - MEM_OFF) % PAGE_SIZE;
     if remainder != 0 { return; }
     let mut s = pool.slots.lock();
     if idx < s.len() {
@@ -288,7 +288,7 @@ pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<u
         }
         if ok {
             for j in start..start + sz { s[j] = false; }
-            return Some(start * PAGE_SZ + MEM_OFF);
+            return Some(start * PAGE_SIZE + MEM_OFF);
         }
     }
     None
@@ -355,14 +355,14 @@ impl BuddyAllocator {
         let mut remaining = total_pages;
         while remaining >= block_pages {
             free_lists[usable_order].push(addr);
-            addr += block_pages * PAGE_SZ;
+            addr += block_pages * PAGE_SIZE;
             remaining -= block_pages;
         }
         for o in (0..usable_order).rev() {
             let pages = 1 << o;
             while remaining >= pages {
                 free_lists[o].push(addr);
-                addr += pages * PAGE_SZ;
+                addr += pages * PAGE_SIZE;
                 remaining -= pages;
             }
         }
@@ -380,10 +380,10 @@ impl BuddyAllocator {
         for o in order..=self.max_order {
             if let Some(block) = self.free_lists[o].pop() {
                 let mut current_order = o;
-                let mut addr = block;
+                let addr = block;
                 while current_order > order {
                     current_order -= 1;
-                    let buddy = addr + (1 << current_order) * PAGE_SZ;
+                    let buddy = addr + (1 << current_order) * PAGE_SIZE;
                     self.free_lists[current_order].push(buddy);
                 }
                 self.allocated.fetch_add(1 << order, Ordering::Relaxed);
@@ -398,7 +398,7 @@ impl BuddyAllocator {
         let mut current_addr = addr;
         let mut current_order = order;
         while current_order < self.max_order {
-            let block_size = (1 << current_order) * PAGE_SZ;
+            let block_size = (1 << current_order) * PAGE_SIZE;
             let buddy_addr = current_addr ^ block_size;
             if let Some(pos) = self.free_lists[current_order].iter().position(|&a| a == buddy_addr) {
                 self.free_lists[current_order].remove(pos);
@@ -530,7 +530,7 @@ impl VmRegion {
         let lo = self.offset;
         let ro = self.offset.wrapping_add(ll);
         let mut lf = self.flags;
-        let mut rf = self.flags;
+        let rf = self.flags;
         if self.flags & VM_GROWSDOWN != 0 { lf &= !VM_GROWSDOWN; }
         let l = VmRegion { base: self.base, len: ll, flags: lf, offset: lo, tag: self.tag, ref_count: AtomicUsize::new(self.ref_count.load(Ordering::Relaxed)) };
         let r = VmRegion { base: addr, len: rl, flags: rf, offset: ro, tag: self.tag, ref_count: AtomicUsize::new(self.ref_count.load(Ordering::Relaxed)) };
@@ -624,7 +624,7 @@ impl VmMap {
 
     pub fn find_free(&self, len: usize, align: usize) -> Option<usize> {
         if len == 0 { return Some(self.mmap_base); }
-        let al = if align > 1 { align } else { PAGE_SZ };
+        let al = if align > 1 { align } else { PAGE_SIZE };
         let al_mask = al - 1;
         let mut cand = (self.mmap_base + al_mask) & !al_mask;
         let mut iters = 0;
@@ -725,7 +725,7 @@ impl AddrSpace {
     }
 
     pub fn handle_cow_fault(&self, addr: usize, pool: &FramePool) -> Result<usize, &'static str> {
-        let page_addr = addr & !(PAGE_SZ - 1);
+        let page_addr = addr & !(PAGE_SIZE - 1);
         let region = self.vm_map.find(addr).ok_or("segfault")?;
         if region.flags & VM_WRITE == 0 { return Err("segfault"); }
         let mut cow = self.cow_pages.lock();
@@ -738,11 +738,11 @@ impl AddrSpace {
             frame.down();
             let new_frame = PgFrame::with_rc(1);
             cow.insert(page_addr, new_frame);
-            Ok(new_frame_id * PAGE_SZ + MEM_OFF)
+            Ok(new_frame_id * PAGE_SIZE + MEM_OFF)
         } else {
             let frame_id = pool.get_inner().ok_or("oom")?;
             cow.insert(page_addr, PgFrame::with_rc(1));
-            Ok(frame_id * PAGE_SZ + MEM_OFF)
+            Ok(frame_id * PAGE_SIZE + MEM_OFF)
         }
     }
 

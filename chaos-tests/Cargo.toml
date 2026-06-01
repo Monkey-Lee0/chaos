@@ -8,6 +8,10 @@ description = "Test suite for the Chaos Monolith Kernel debugging exercise"
 spin = "0.12.0"
 rcore-memory = { path = "../crate/memory" }
 sync = { path = "../crate/sync" }
+log = "0.4.30"
+lazy_static = "1.5.0"
+trapframe = { git = "https://github.com/rcore-os/trapframe-rs", rev = "bdfe5aa" }
+bitflags = "1.2"
 
 [dev-dependencies]
 
